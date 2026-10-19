@@ -30,9 +30,96 @@ function createMockPipeline() {
     transcribeForMediaStream: vi.fn().mockImplementation((_stream, options: MockStreamingCallbacks) => {
       options.onSentenceEnd(mockTranscribedContent)
     }),
+    transcribeForRecording: vi.fn<(recording: Blob | null | undefined) => Promise<string | undefined>>()
+      .mockResolvedValue(mockTranscribedContent),
     stopStreamingTranscription: vi.fn().mockResolvedValue(undefined),
     supportsStreamInput: ref(true),
   }
+}
+
+/**
+ * Platform boundaries of the recorder-backed dictation session.
+ *
+ * `useVoiceInputSession` runs for real; only the VAD model worker and the mediabunny recorder are replaced.
+ * Tests drive speech through the captured VAD callbacks, the same way the VAD worklet does in the browser.
+ */
+const voiceInputBoundary = await vi.hoisted(async () => {
+  const vue = await import('vue')
+
+  return {
+    vad: {
+      callbacks: undefined as { onSpeechStart?: () => void, onSpeechEnd?: () => void } | undefined,
+      init: vi.fn<() => Promise<void>>(),
+      start: vi.fn<(stream: MediaStream) => Promise<void>>(),
+      dispose: vi.fn<() => void>(),
+    },
+    recorder: {
+      isRecording: vue.ref(false),
+      startRecord: vi.fn<() => Promise<void>>(),
+      stopRecord: vi.fn<() => Promise<void>>(),
+      onStopRecordHook: undefined as ((recording: Blob | undefined) => Promise<void>) | undefined,
+    },
+  }
+})
+
+vi.mock('@proj-airi/stage-ui/stores/ai/models/vad', async () => {
+  const vue = await vi.importActual<typeof import('vue')>('vue')
+
+  return {
+    useVAD: (_workletUrl: string, options: typeof voiceInputBoundary.vad.callbacks) => {
+      voiceInputBoundary.vad.callbacks = options
+      return {
+        init: voiceInputBoundary.vad.init,
+        start: voiceInputBoundary.vad.start,
+        dispose: voiceInputBoundary.vad.dispose,
+        loaded: vue.ref(true),
+        loading: vue.ref(false),
+        isSpeech: vue.ref(false),
+        isSpeechProb: vue.ref(0),
+        isSpeechHistory: vue.ref([]),
+        inferenceError: vue.ref(),
+        minSilenceDurationMs: vue.ref(1200),
+      }
+    },
+  }
+})
+
+vi.mock('@proj-airi/stage-ui/composables/audio/audio-recorder', () => {
+  return {
+    useAudioRecorder: () => ({
+      isRecording: voiceInputBoundary.recorder.isRecording,
+      startRecord: voiceInputBoundary.recorder.startRecord,
+      stopRecord: voiceInputBoundary.recorder.stopRecord,
+      onStopRecord: (hook: (recording: Blob | undefined) => Promise<void>) => {
+        voiceInputBoundary.recorder.onStopRecordHook = hook
+        return () => {}
+      },
+    }),
+  }
+})
+
+function resetVoiceInputBoundary() {
+  const { recorder, vad } = voiceInputBoundary
+  vad.callbacks = undefined
+  vad.init.mockResolvedValue(undefined)
+  vad.start.mockResolvedValue(undefined)
+  recorder.isRecording.value = false
+  recorder.onStopRecordHook = undefined
+  recorder.startRecord.mockImplementation(async () => {
+    recorder.isRecording.value = true
+  })
+  // Mirrors useAudioRecorder: the recorder becomes idle first, then stop hooks receive the finalized WAV blob.
+  recorder.stopRecord.mockImplementation(async () => {
+    recorder.isRecording.value = false
+    await recorder.onStopRecordHook?.(new Blob(['segment-audio'], { type: 'audio/wav' }))
+  })
+}
+
+/** Plays one VAD-detected utterance: speech start opens a recorder segment and speech end finalizes it. */
+async function speakSegment() {
+  voiceInputBoundary.vad.callbacks?.onSpeechStart?.()
+  await vi.waitFor(() => expect(voiceInputBoundary.recorder.isRecording.value).toBe(true))
+  voiceInputBoundary.vad.callbacks?.onSpeechEnd?.()
 }
 
 function createMockAudioDevice() {
@@ -96,6 +183,7 @@ describe('useTranscriptions', () => {
     mockHearingPipeline = createMockPipeline()
     mockAudioDevice = createMockAudioDevice()
     mockProvidersStore = createMockStore()
+    resetVoiceInputBoundary()
 
     // Mock 'until' to resolve immediately for stream checks
     ;(until as any).mockImplementation((_source: Ref) => ({
@@ -409,6 +497,149 @@ describe('useTranscriptions', () => {
       await nextTick()
       expect(mockHearingPipeline.stopStreamingTranscription).toHaveBeenCalled()
       expect(mockHearingPipeline.removeStreamingTranscriptionConsumer).toHaveBeenCalled()
+    })
+  })
+
+  describe('recorder-backed dictation (non-streaming providers)', () => {
+    function prepareRecorderBackedProvider() {
+      mockHearingStore.configured.value = true
+      mockAudioDevice.stream.value = { id: 'stream-1' } as any
+      mockAudioDevice.enabled.value = true
+      mockHearingPipeline.supportsStreamInput.value = false
+    }
+
+    it('transcribes each spoken segment into the input and auto-sends it', async () => {
+      // ROOT CAUSE:
+      //
+      // Whisper (Local), the Hearing default, cannot stream input, so startStreaming() returned early.
+      //
+      // if (!supportsStreamInput.value) { ...; isListening.value = false; return }
+      //
+      // We fixed this with useVoiceInputSession: each transcribed segment goes to the streaming final-text handler.
+      prepareRecorderBackedProvider()
+      mockHearingStore.autoSendDelay.value = 500
+      const mockInput = ref('prefix')
+      const mockSendMessage = vi.fn()
+
+      const { isListening, startStreamingTranscription }
+        = useTranscriptions({ ...createOptions(), messageInputRef: mockInput, sendMessage: mockSendMessage })
+      await startStreamingTranscription()
+
+      expect(isListening.value).toBe(true)
+      expect(voiceInputBoundary.vad.start).toHaveBeenCalledWith(expect.objectContaining({ id: 'stream-1' }))
+      expect(mockHearingPipeline.transcribeForMediaStream).not.toHaveBeenCalled()
+
+      await speakSegment()
+      await vi.waitFor(() => expect(mockInput.value).toBe(`prefix ${mockTranscribedContent}`))
+
+      expect(mockHearingPipeline.transcribeForRecording).toHaveBeenCalledOnce()
+      expect(mockHearingPipeline.transcribeForRecording).toHaveBeenCalledWith(expect.any(Blob))
+      expect(mockSendMessage).not.toHaveBeenCalled()
+
+      vi.advanceTimersByTime(500)
+
+      expect(mockSendMessage).toHaveBeenCalledOnce()
+    })
+
+    it('stops the recorder and drops the segment that is being recorded', async () => {
+      prepareRecorderBackedProvider()
+      const mockInput = ref('')
+
+      const { isListening, startStreamingTranscription, stopStreamingTranscription }
+        = useTranscriptions({ ...createOptions(), messageInputRef: mockInput })
+      await startStreamingTranscription()
+
+      voiceInputBoundary.vad.callbacks?.onSpeechStart?.()
+      await vi.waitFor(() => expect(voiceInputBoundary.recorder.isRecording.value).toBe(true))
+
+      await stopStreamingTranscription()
+
+      expect(isListening.value).toBe(false)
+      expect(voiceInputBoundary.recorder.stopRecord).toHaveBeenCalledOnce()
+      expect(voiceInputBoundary.recorder.isRecording.value).toBe(false)
+      expect(voiceInputBoundary.vad.dispose).toHaveBeenCalled()
+      expect(mockHearingPipeline.transcribeForRecording).not.toHaveBeenCalled()
+      expect(mockHearingPipeline.stopStreamingTranscription).not.toHaveBeenCalled()
+      expect(mockInput.value).toBe('')
+    })
+
+    it('drops a segment whose transcription finishes after stop', async () => {
+      prepareRecorderBackedProvider()
+      const mockInput = ref('')
+      const mockSendMessage = vi.fn()
+      let finishTranscription: (text: string) => void = () => {}
+      mockHearingPipeline.transcribeForRecording.mockImplementation(() => new Promise((resolve) => {
+        finishTranscription = resolve
+      }))
+
+      const { startStreamingTranscription, stopStreamingTranscription }
+        = useTranscriptions({ ...createOptions(), messageInputRef: mockInput, sendMessage: mockSendMessage })
+      await startStreamingTranscription()
+      await speakSegment()
+      await vi.waitFor(() => expect(mockHearingPipeline.transcribeForRecording).toHaveBeenCalledOnce())
+
+      await stopStreamingTranscription()
+      finishTranscription(mockTranscribedContent)
+      await vi.waitFor(() => expect(voiceInputBoundary.vad.dispose).toHaveBeenCalled())
+      vi.advanceTimersByTime(5000)
+
+      expect(mockInput.value).toBe('')
+      expect(mockSendMessage).not.toHaveBeenCalled()
+    })
+
+    it('drops a segment whose recorder finishes finalizing after stop', async () => {
+      // The session resets its transcription queue on stop, but this segment is queued after that reset,
+      // so only the dictation delivery gate can drop it.
+      prepareRecorderBackedProvider()
+      const mockInput = ref('')
+      const { recorder } = voiceInputBoundary
+      let finishFinalize: () => void = () => {}
+      recorder.stopRecord.mockImplementation(async () => {
+        recorder.isRecording.value = false
+        await new Promise<void>((resolve) => {
+          finishFinalize = resolve
+        })
+        await recorder.onStopRecordHook?.(new Blob(['segment-audio'], { type: 'audio/wav' }))
+      })
+
+      const { startStreamingTranscription, stopStreamingTranscription }
+        = useTranscriptions({ ...createOptions(), messageInputRef: mockInput })
+      await startStreamingTranscription()
+      await speakSegment()
+      await vi.waitFor(() => expect(recorder.stopRecord).toHaveBeenCalledOnce())
+
+      await stopStreamingTranscription()
+      finishFinalize()
+      vi.advanceTimersByTime(5000)
+      // stopRecord resolves after its stop hook has queued and processed the late segment.
+      await vi.waitFor(() => expect(recorder.stopRecord).toHaveResolved())
+
+      expect(mockHearingPipeline.transcribeForRecording).not.toHaveBeenCalled()
+      expect(mockInput.value).toBe('')
+    })
+
+    it('tears down a VAD start that finishes loading after stop', async () => {
+      prepareRecorderBackedProvider()
+      let finishVadLoad: () => void = () => {}
+      voiceInputBoundary.vad.init.mockImplementation(() => new Promise((resolve) => {
+        finishVadLoad = resolve
+      }))
+
+      const { isListening, startStreamingTranscription, stopStreamingTranscription } = useTranscriptions(createOptions())
+      const starting = startStreamingTranscription()
+      await vi.waitFor(() => expect(voiceInputBoundary.vad.init).toHaveBeenCalledOnce())
+
+      expect(isListening.value).toBe(true)
+
+      const stopping = stopStreamingTranscription()
+      finishVadLoad()
+      await Promise.all([starting, stopping])
+
+      expect(isListening.value).toBe(false)
+      expect(voiceInputBoundary.vad.start).toHaveBeenCalledOnce()
+      expect(voiceInputBoundary.vad.dispose).toHaveBeenCalledOnce()
+      expect(voiceInputBoundary.vad.dispose.mock.invocationCallOrder[0])
+        .toBeGreaterThan(voiceInputBoundary.vad.start.mock.invocationCallOrder[0])
     })
   })
 

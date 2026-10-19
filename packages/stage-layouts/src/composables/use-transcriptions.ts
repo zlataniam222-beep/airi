@@ -1,5 +1,7 @@
+import type { VoiceInputSessionGate, VoiceInputSessionLogLevel } from '@proj-airi/stage-ui/composables/audio/voice-input-session'
 import type { MaybeRefOrGetter, Ref } from 'vue'
 
+import { useVoiceInputSession } from '@proj-airi/stage-ui/composables/audio/voice-input-session'
 import { useStreamingTranscriptionInput } from '@proj-airi/stage-ui/composables/use-streaming-transcription-input'
 import { useHearingSpeechInputPipeline, useHearingStore } from '@proj-airi/stage-ui/stores/modules/hearing'
 import { useProviderStore } from '@proj-airi/stage-ui/stores/providers/provider'
@@ -14,6 +16,47 @@ interface TranscriptionOptions {
   isStageTamagotchi: MaybeRefOrGetter<boolean>
 }
 
+/**
+ * Transport that delivers dictation text while listening.
+ *
+ * - `streaming`: the shared Hearing streaming session sends text to this consumer by its consumer id.
+ * - `recording`: a local voice-input session records each spoken segment and transcribes it with
+ *   `transcribeForRecording`. Used when the Hearing provider cannot stream input, such as Whisper (Local).
+ */
+type DictationTransport = 'streaming' | 'recording'
+
+/** Forwards voice-input session diagnostics to the console with this composable as the source. */
+function logVoiceInputSession(level: VoiceInputSessionLogLevel, event: string, message: string, details?: Record<string, unknown>) {
+  const output = `[Dictation] ${event}: ${message}`
+  if (level === 'error') {
+    console.error(output, details ?? {}, { source: 'useTranscriptions' })
+    return
+  }
+  if (level === 'warn') {
+    console.warn(output, details ?? {}, { source: 'useTranscriptions' })
+    return
+  }
+
+  // NOTICE: The volume fallback reports a microphone level sample every two seconds while dictation runs.
+  // That sample only helps when tuning thresholds, so it is not forwarded; every other event is.
+  if (event === 'volume-fallback-level')
+    return
+
+  console.info(output, details ?? {}, { source: 'useTranscriptions' })
+}
+
+/**
+ * Chat-input dictation for the chat area microphone button.
+ *
+ * Start chooses one {@link DictationTransport} from the Hearing provider's `supportsStreamInput` and keeps it
+ * until stop. Both transports write into `messageInputRef` through the same handlers, so callers do not branch
+ * on the provider.
+ *
+ * Stop ends the active transport and clears a pending auto-send. On the recording transport, stop drops the
+ * segment that is being recorded and every segment that is still waiting for or running transcription: no text
+ * from those segments reaches the input. The microphone stream belongs to the audio device settings store and
+ * stays open.
+ */
 export function useTranscriptions(options: TranscriptionOptions) {
   const { messageInputRef: messageInput, sendMessage, isStageTamagotchi } = options
 
@@ -30,6 +73,65 @@ export function useTranscriptions(options: TranscriptionOptions) {
   const isListening = ref(false)
   const transcriptionConsumerId = `interactive-area:${useId()}`
   const streamingInput = useStreamingTranscriptionInput(messageInput)
+
+  /**
+   * Transport that owns the current listening session; `undefined` when not listening.
+   * Set when a transport starts and cleared at the start of stop, before any await, so recorder results that
+   * settle during or after stop see that dictation ended.
+   */
+  let activeTransport: DictationTransport | undefined
+
+  /**
+   * Tail of recorder-session start and stop work.
+   *
+   * Starting loads the VAD model, which can take seconds. `useVAD` does not cancel a load that is in progress,
+   * so a stop that ran during the load would leave the VAD worklet running after it finishes. Each start and
+   * stop waits for the previous one; the last requested operation decides the final state.
+   */
+  let recordingLifecycle: Promise<void> = Promise.resolve()
+
+  function queueRecordingLifecycle(operation: () => Promise<void>) {
+    const run = recordingLifecycle.then(operation)
+    // A failed operation must not block later starts or stops; the caller of that operation gets the error.
+    recordingLifecycle = run.catch(() => {})
+    return run
+  }
+
+  /**
+   * Skips recorder segments that settle after dictation stopped.
+   *
+   * `voiceInputSession.stop()` invalidates queued and running transcription work. A segment whose recorder was
+   * still finalizing when stop ran is queued after that reset, so it looks current to the session. Checking the
+   * transport before and after the provider call drops that segment too.
+   */
+  function inspectRecordingDelivery(): VoiceInputSessionGate | undefined {
+    if (activeTransport === 'recording')
+      return undefined
+
+    return { skip: true, reason: 'dictation-stopped' }
+  }
+
+  /**
+   * Final transcript text from either transport. Both transports send final text here, so manual-edit
+   * detection and auto-send behave the same for streaming and recorder-backed providers.
+   */
+  function handleSentenceEnd(delta: string) {
+    if (streamingInput.commit(delta)) {
+      console.info('Received final transcription:', delta, { source: 'useTranscriptions' })
+      debouncedAutoSend()
+    }
+  }
+
+  /**
+   * Recorder-backed transport for providers that cannot stream input.
+   * VAD segments each utterance; each segment becomes one `transcribeForRecording` call and one final text.
+   */
+  const voiceInputSession = useVoiceInputSession(stream, {
+    onLog: logVoiceInputSession,
+    inspectBeforeTranscription: inspectRecordingDelivery,
+    inspectAfterTranscription: inspectRecordingDelivery,
+    onTranscriptionResult: ({ text }) => handleSentenceEnd(text),
+  })
 
   // Auto-send logic
   let autoSendTimeout: ReturnType<typeof setTimeout> | undefined
@@ -67,9 +169,17 @@ export function useTranscriptions(options: TranscriptionOptions) {
     if (!isListening.value)
       return
 
+    const transport = activeTransport
+    activeTransport = undefined
+    clearPendingAutoSend()
+
+    if (transport === 'recording') {
+      await stopRecording()
+      return
+    }
+
     try {
       console.info('Stopping transcription...', { source: 'useTranscriptions' })
-      clearPendingAutoSend()
       await stopStreamingTranscription(true)
       isListening.value = false
       console.info('Transcription stopped', { source: 'useTranscriptions' })
@@ -77,6 +187,49 @@ export function useTranscriptions(options: TranscriptionOptions) {
     catch (err) {
       console.error('Error stopping transcription:', err, { source: 'useTranscriptions' })
       isListening.value = false
+    }
+  }
+
+  /**
+   * Stops recorder-backed dictation. Drops the active recording and invalidates queued or running
+   * transcriptions (see `useTranscriptions`). The shared streaming session is left alone because other
+   * consumers may still use it.
+   */
+  async function stopRecording() {
+    // Listening ends before teardown, so a button press during teardown starts a new session that the
+    // lifecycle queue runs after this stop, instead of a second stop.
+    isListening.value = false
+    console.info('Stopping recorder-backed transcription...', { source: 'useTranscriptions' })
+
+    try {
+      await queueRecordingLifecycle(() => voiceInputSession.stop({ flushActiveRecording: false }))
+      console.info('Recorder-backed transcription stopped', { source: 'useTranscriptions' })
+    }
+    catch (err) {
+      console.error('Error stopping recorder-backed transcription:', err, { source: 'useTranscriptions' })
+    }
+  }
+
+  /**
+   * Starts recorder-backed dictation on the current microphone stream.
+   * Listening state is set before the VAD model loads so a second button press during the load stops dictation.
+   */
+  async function startRecording() {
+    if (activeTransport === 'recording')
+      return
+
+    activeTransport = 'recording'
+    isListening.value = true
+
+    try {
+      await queueRecordingLifecycle(() => voiceInputSession.startAutoSegmentation())
+      console.info('Recorder-backed transcription initiated successfully', { source: 'useTranscriptions' })
+    }
+    catch (err) {
+      console.error('Failed to start recorder-backed transcription:', err, { source: 'useTranscriptions' })
+      // Runs the normal stop so listening state resets and no partly started recorder work stays alive.
+      await stopStreaming()
+      throw err
     }
   }
 
@@ -130,17 +283,6 @@ export function useTranscriptions(options: TranscriptionOptions) {
       console.info('Web Speech API configured as default provider', { source: 'useTranscriptions' })
     }
 
-    // Check if streaming input is supported
-    // TODO: implement non-streaming transcription
-    if (!supportsStreamInput.value) {
-      const errorMsg = 'Streaming input not supported by the selected transcription provider. Please select a provider that supports streaming (e.g., Web Speech API).'
-      console.warn(errorMsg, { source: 'useTranscriptions' })
-      // Clean up any existing sessions from other pages (e.g., test page) that might interfere
-      await stopStreamingTranscription(true)
-      isListening.value = false
-      return
-    }
-
     try {
       // Request microphone permission if needed (microphone should already be enabled by the user)
       if (!stream.value) {
@@ -175,6 +317,12 @@ export function useTranscriptions(options: TranscriptionOptions) {
       return
     }
 
+    if (!supportsStreamInput.value) {
+      console.info('Starting recorder-backed transcription with stream:', stream.value.id, { source: 'useTranscriptions' })
+      await startRecording()
+      return
+    }
+
     console.info('Starting streaming transcription with stream:', stream.value.id, { source: 'useTranscriptions' })
 
     // Allow calling this even if already listening - transcribeForMediaStream will handle session reuse/restart
@@ -183,18 +331,14 @@ export function useTranscriptions(options: TranscriptionOptions) {
     try {
       await transcribeForMediaStream(stream.value, {
         consumerId: transcriptionConsumerId,
-        onSentenceEnd: (delta) => {
-          if (streamingInput.commit(delta)) {
-            console.info('Received final transcription:', delta, { source: 'useTranscriptions' })
-            debouncedAutoSend()
-          }
-        },
+        onSentenceEnd: handleSentenceEnd,
         onSpeechEnd: streamingInput.clear,
         onTranscriptionUpdate: streamingInput.replace,
       })
 
       // Only set listening to true if transcription started successfully
       // (transcribeForMediaStream might return early if session already exists)
+      activeTransport = 'streaming'
       isListening.value = true
       console.info('Streaming transcription initiated successfully', { source: 'useTranscriptions' })
     }

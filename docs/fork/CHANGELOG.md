@@ -2,6 +2,22 @@
 
 Newest entries first. See [`README.md`](./README.md) for the entry format.
 
+## 2026-10-19: Chat microphone button works with Whisper (Local)
+
+- **What:** the chat-area microphone button now dictates with Hearing providers that cannot stream input, such
+  as Whisper (Local). It records each spoken phrase, transcribes it, and adds the text to the chat input.
+  Auto-send works the same way as with streaming providers.
+- **Why:** after Whisper (Local) became the default, the button only logged "Streaming input not supported"
+  and did nothing. Before, an empty Hearing setting made the button fall back to the browser Web Speech API.
+- **Files:** `packages/stage-layouts/src/composables/use-transcriptions.ts` (+ `use-transcriptions.test.ts`).
+- **Branch / commit:** `claude/zen-feynman-fhw9jh`.
+- **Notes:**
+  - It reuses `useVoiceInputSession` from stage-ui (voice activity detection, recording, and dropping work
+    that is no longer current). Stopping drops the phrase being recorded and any transcription still running.
+  - Checks: `stage-layouts` typecheck and lint pass; 38 tests pass (5 new). Not tested with a real microphone.
+  - Known limit: on stage-web and stage-pocket, the page already transcribes speech whenever the microphone is
+    on. With dictation on too, each phrase is transcribed twice. Streaming providers already behave this way.
+
 ## 2026-10-19: Built-in local Whisper transcription (default)
 
 - **What:** added **Whisper (Local)**, a speech-to-text provider that runs OpenAI Whisper on the device
