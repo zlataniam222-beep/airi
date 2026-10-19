@@ -2,6 +2,29 @@
 
 Newest entries first. See [`README.md`](./README.md) for the entry format.
 
+## 2026-10-19: Built-in local Whisper transcription (default)
+
+- **What:** added **Whisper (Local)**, a speech-to-text provider that runs OpenAI Whisper on the device
+  with transformers.js. New installs use it for Hearing by default with **Whisper Small**. Base and
+  Large v3 Turbo can be selected. The provider has its own settings page with a model download button.
+- **Why:** the user wanted local transcription that works by default, without an account or API key.
+- **Files:**
+  - Engine: `packages/stage-ui/src/libs/workers/worker.ts`, `libs/inference/{constants,coordinator}.ts`,
+    `libs/inference/adapters/whisper.ts` (+ test), `components/scenarios/settings/ModelCacheManager.vue`.
+  - Provider: `packages/stage-ui/src/libs/providers/providers/whisper-local/` (+ browser test),
+    `providers/{index,registry}.ts`, `libs/providers/attributes.ts`.
+  - Defaults: `packages/stage-ui/src/stores/modules/{hearing,default}.ts` (+ `default.test.ts`).
+  - UI and text: `packages/stage-pages/src/pages/settings/providers/transcription/whisper-local.vue`,
+    `packages/i18n/src/locales/en/settings.yaml`, `packages/i18n/glossary/terms.yaml`.
+- **Branch / commit:** `claude/zen-feynman-fhw9jh`.
+- **Notes:**
+  - Details and limits: [`notes/2026-10-19-built-in-whisper.md`](./notes/2026-10-19-built-in-whisper.md).
+  - Not tested with real models in the cloud session, because `huggingface.co` is blocked there.
+  - Checks: `stage-ui` and `stage-pages` typecheck pass; 128 node tests pass (inference, providers,
+    Hearing, defaults); the provider browser test (9 tests) passes in Chromium with a local config.
+  - The glossary entry for "Whisper" stops translators from translating the product name as the
+    ordinary word for quiet speech.
+
 ## 2026-10-19: Reverse-engineering notes and code maps
 
 - **What:** added two notes and two Graphify code maps:

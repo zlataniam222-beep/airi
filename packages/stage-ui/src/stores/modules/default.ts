@@ -1,4 +1,6 @@
+import { DEFAULT_WHISPER_MODEL_ID } from '../../libs/inference/constants'
 import { OFFICIAL_CHAT_PROVIDER_ID, OFFICIAL_SPEECH_PROVIDER_ID, OFFICIAL_TRANSCRIPTION_PROVIDER_ID, OFFICIAL_VISION_PROVIDER_ID } from '../../libs/providers/providers/official/constants'
+import { WHISPER_LOCAL_PROVIDER_ID } from '../../libs/providers/providers/whisper-local/constants'
 import { useProviderConfigStore } from '../providers/config'
 import { useProviderStore } from '../providers/provider'
 import { useConsciousnessStore } from './consciousness'
@@ -14,14 +16,21 @@ const officialModuleDefaults = {
   vision: { provider: OFFICIAL_VISION_PROVIDER_ID, model: 'auto' },
 } as const
 
+// Hearing runs on this device without an account. Login fills an empty Hearing
+// module with it, and logout replaces an official Hearing selection with it.
+const localHearingDefault = { provider: WHISPER_LOCAL_PROVIDER_ID, model: DEFAULT_WHISPER_MODEL_ID } as const
+
 /**
- * Applies official defaults to empty inference modules.
+ * Applies module defaults after authentication.
  *
  * The caller must own synchronized Pinia leadership. This command keeps the
  * configuration of each custom provider unchanged. It configures the official
- * choice for every module, then applies it only to empty or incomplete
- * official selections. Provider setup completes before module selections
- * become visible to other windows.
+ * provider of every module, including Hearing, so a signed-in user can select
+ * it. Empty consciousness, speech, and vision modules then use the official
+ * choice. An empty Hearing module uses Whisper (Local) with the default Whisper
+ * model instead. An official selection without a model receives the official
+ * `auto` model. Provider setup completes before module selections become
+ * visible to other windows.
  *
  * @returns `true` when the command changes module or provider state.
  */
@@ -68,8 +77,8 @@ export async function configureAsDefaultsIfEmpty(): Promise<boolean> {
 
   if (needsHearingDefault) {
     hearingStore.activeCustomModelName = ''
-    hearingStore.activeTranscriptionProvider = officialModuleDefaults.hearing.provider
-    hearingStore.activeTranscriptionModel = officialModuleDefaults.hearing.model
+    hearingStore.activeTranscriptionProvider = localHearingDefault.provider
+    hearingStore.activeTranscriptionModel = localHearingDefault.model
     changed = true
   }
   else if (usesOfficialHearing && !hearingStore.activeTranscriptionModel) {
@@ -110,7 +119,10 @@ export async function configureAsDefaultsIfEmpty(): Promise<boolean> {
  *
  * The caller must own synchronized Pinia leadership. Custom module selections
  * remain unchanged. An official speech selection falls back to No Speech so
- * the speech pipeline keeps its account-free disabled state after logout.
+ * the speech pipeline keeps its account-free disabled state after logout. An
+ * official Hearing selection falls back to Whisper (Local) with the default
+ * Whisper model, so voice input keeps working without an account. Other
+ * official module selections become empty.
  *
  * @returns `true` when the command changes module or provider state.
  */
@@ -131,8 +143,8 @@ export async function unconfigureAuthenticationProviders(): Promise<boolean> {
   }
 
   if (providerConfigStore.providers[hearingStore.activeTranscriptionProvider]?.configuredBy === 'authentication') {
-    hearingStore.activeTranscriptionProvider = ''
-    hearingStore.activeTranscriptionModel = ''
+    hearingStore.activeTranscriptionProvider = localHearingDefault.provider
+    hearingStore.activeTranscriptionModel = localHearingDefault.model
     hearingStore.activeCustomModelName = ''
     changed = true
   }

@@ -22,8 +22,10 @@ import vadWorkletUrl from '../../workers/vad/process.worklet?worker&url'
 import { useAnalytics } from '../../composables/use-analytics'
 import { activeTurnSpan, startSpan } from '../../composables/use-io-tracer'
 import { createVadStreamingSession } from '../../libs/audio/vad-streaming-session'
+import { DEFAULT_WHISPER_MODEL_ID } from '../../libs/inference/constants'
 import { OFFICIAL_TRANSCRIPTION_PROVIDER_ID } from '../../libs/providers'
 import { APPLE_SPEECH_TRANSCRIPTION_PROVIDER_ID, executeAppleSpeechStream } from '../../libs/providers/providers/apple-speech'
+import { WHISPER_LOCAL_PROVIDER_ID } from '../../libs/providers/providers/whisper-local/constants'
 import { streamTranscription } from '../../libs/providers/stream-transcription'
 import { useVAD } from '../ai/models/vad'
 import { useProviderConfigStore } from '../providers/config'
@@ -330,8 +332,10 @@ export const useHearingStore = defineStore('hearing-store', () => {
   const persistenceOptions = { listenToStorageChanges: false }
 
   // State
-  const activeTranscriptionProvider = useLocalStorageManualReset('settings/hearing/active-provider', '', persistenceOptions)
-  const activeTranscriptionModel = useLocalStorageManualReset('settings/hearing/active-model', '', persistenceOptions)
+  // A new install transcribes with local Whisper, which needs no account or API key.
+  // Saved selections, including an empty one, keep their stored value.
+  const activeTranscriptionProvider = useLocalStorageManualReset<string>('settings/hearing/active-provider', WHISPER_LOCAL_PROVIDER_ID, persistenceOptions)
+  const activeTranscriptionModel = useLocalStorageManualReset<string>('settings/hearing/active-model', DEFAULT_WHISPER_MODEL_ID, persistenceOptions)
   const activeCustomModelName = useLocalStorageManualReset('settings/hearing/active-custom-model', '', persistenceOptions)
   const transcriptionModelSearchQuery = refManualReset<string>('')
   const autoSendEnabled = useLocalStorageManualReset<boolean>('settings/hearing/auto-send-enabled', false, persistenceOptions)

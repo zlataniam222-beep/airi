@@ -8,6 +8,7 @@ import './local-audio'
 import './kokoro-local'
 import './nvidia'
 import './official'
+import './whisper-local'
 
 registerProviders(portableProviderDefinitions)
 
@@ -22,3 +23,7 @@ export {
 } from './registry'
 
 export type { StageProviderId } from './registry'
+
+export {
+  WHISPER_LOCAL_PROVIDER_ID,
+} from './whisper-local'

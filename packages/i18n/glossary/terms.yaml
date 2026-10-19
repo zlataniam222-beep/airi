@@ -318,6 +318,18 @@
       status: preferred
       context: Select a model
 
+- id: whisper
+  subject: providers
+  translatable: false
+  definition: A speech recognition model from OpenAI that changes speech to text.
+  note: A product name, not the word for quiet speech.
+  url: https://github.com/openai/whisper
+  terms:
+    - text: Whisper
+      part-of-speech: proper noun
+      status: preferred
+      context: Use Whisper (Local) for Hearing
+
 # ---------------------------------------------------------------------------------------
 # The modules
 #

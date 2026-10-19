@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { clearModelCache, formatBytes, getModelCacheSize, isModelCached } from '@proj-airi/stage-ui/libs/inference'
+import { WHISPER_MODELS } from '@proj-airi/stage-ui/libs/inference/constants'
 import { Button, GhostButton } from '@proj-airi/ui'
 import { onMounted, ref } from 'vue'
 
@@ -10,7 +11,7 @@ const clearing = ref(false)
 // Known model IDs to check cache status
 const knownModels = [
   { id: 'onnx-community/Kokoro-82M-v1.0-ONNX', name: 'Kokoro TTS' },
-  { id: 'onnx-community/whisper-large-v3-turbo', name: 'Whisper ASR' },
+  ...WHISPER_MODELS.map(model => ({ id: model.repo, name: model.name })),
   { id: 'Xenova/modnet', name: 'Background Removal' },
 ]
 

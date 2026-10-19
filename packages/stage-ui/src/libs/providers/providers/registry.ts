@@ -19,6 +19,7 @@ import type {
   providerOfficialSpeechStreaming,
   providerOfficialTranscription,
 } from './official'
+import type { providerWhisperLocal } from './whisper-local'
 
 import { orderBy } from 'es-toolkit'
 
@@ -37,6 +38,7 @@ type StageOnlyProviderId
     | typeof providerOfficialSpeech.id
     | typeof providerOfficialSpeechStreaming.id
     | typeof providerOfficialTranscription.id
+    | typeof providerWhisperLocal.id
 
 /** IDs of definitions registered by stage-ui, including portable definitions. */
 export type StageProviderId = PortableProviderId | StageOnlyProviderId

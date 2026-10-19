@@ -1561,6 +1561,58 @@ pages:
       browser-web-speech-api:
         description: Browser-native STT (requires Chrome/Edge/Safari)
         title: Web Speech API
+      whisper-local:
+        title: Whisper (Local)
+        description: >-
+          Speech recognition on this device with OpenAI Whisper. It works
+          offline after the first download.
+        callout:
+          label: Runs on this device
+          privacy: >-
+            Whisper changes your speech to text on this device. Your audio does
+            not leave this device.
+          download: AIRI downloads the model one time. After that, Whisper works offline.
+          models: >-
+            Base is the smallest and fastest model. Small is the default model
+            and works better with languages other than English. Large v3 Turbo
+            is the most accurate model, but it is a large download and works
+            best with a GPU that supports WebGPU.
+        models:
+          whisper-base:
+            description: The smallest and fastest model. It works best with English.
+          whisper-small:
+            description: >-
+              The default model. It is more accurate than Base and works better
+              with languages other than English.
+          whisper-large-v3-turbo:
+            description: >-
+              The most accurate model. It is a large download and works best
+              with a GPU that supports WebGPU.
+        fields:
+          field:
+            model:
+              label: Model
+              description: >-
+                Hearing uses this model to change your speech to text. Larger
+                models are more accurate, but they are slower.
+        hearing:
+          label: Hearing
+          active: Hearing uses Whisper (Local).
+          inactive: Hearing uses a different provider.
+          use: Use Whisper (Local) for Hearing
+        download:
+          label: Model download
+          description: >-
+            Download the model now, so that Hearing does not wait for it the
+            first time you speak.
+          action:
+            download: Download model
+            retry: Try again
+          status:
+            loading: Loading the model...
+            progress: 'Downloading the model: {percent}%'
+            ready: The model is ready. Hearing can use it offline.
+            error: The model did not load.
       official:
         title: Official Provider
         description: Official AI provider by AIRI.

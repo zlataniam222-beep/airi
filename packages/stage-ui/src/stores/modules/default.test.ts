@@ -1,7 +1,9 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { DEFAULT_WHISPER_MODEL_ID } from '../../libs/inference/constants'
 import { OFFICIAL_SPEECH_PROVIDER_ID, OFFICIAL_SPEECH_STREAMING_PROVIDER_ID, OFFICIAL_TRANSCRIPTION_PROVIDER_ID } from '../../libs/providers/providers/official'
+import { WHISPER_LOCAL_PROVIDER_ID } from '../../libs/providers/providers/whisper-local/constants'
 import { useProviderConfigStore } from '../providers/config'
 import { useProviderStore } from '../providers/provider'
 import { useConsciousnessStore } from './consciousness'
@@ -59,13 +61,16 @@ describe('official provider module defaults', () => {
     const providerConfigStore = useProviderConfigStore()
     const initializeProvider = vi.spyOn(providerStore, 'initializeProvider')
     const forceProviderConfigured = vi.spyOn(providerStore, 'forceProviderConfigured')
+    // An install from before the Whisper default stored an empty Hearing selection.
+    hearingStore.activeTranscriptionProvider = ''
+    hearingStore.activeTranscriptionModel = ''
 
     await expect(configureAsDefaultsIfEmpty()).resolves.toBe(true)
 
     expect(consciousnessStore.activeProvider).toBe('official-provider')
     expect(consciousnessStore.activeModel).toBe('auto')
-    expect(hearingStore.activeTranscriptionProvider).toBe(OFFICIAL_TRANSCRIPTION_PROVIDER_ID)
-    expect(hearingStore.activeTranscriptionModel).toBe('auto')
+    expect(hearingStore.activeTranscriptionProvider).toBe(WHISPER_LOCAL_PROVIDER_ID)
+    expect(hearingStore.activeTranscriptionModel).toBe(DEFAULT_WHISPER_MODEL_ID)
     expect(speechStore.activeSpeechProvider).toBe(OFFICIAL_SPEECH_PROVIDER_ID)
     expect(speechStore.activeSpeechModel).toBe('auto')
     expect(visionStore.activeProvider).toBe('vision-official-provider')
@@ -105,7 +110,9 @@ describe('official provider module defaults', () => {
     const visionStore = useVisionStore()
     const providerConfigStore = useProviderConfigStore()
     consciousnessStore.customModelName = 'my-model'
+    hearingStore.activeTranscriptionProvider = ''
     hearingStore.activeTranscriptionModel = 'old-transcription-model'
+    hearingStore.activeCustomModelName = 'old-custom-transcription-model'
     speechStore.activeSpeechModel = 'old-speech-model'
     speechStore.activeSpeechVoiceId = 'old-speech-voice'
     visionStore.customModelName = 'old-vision-model'
@@ -115,8 +122,8 @@ describe('official provider module defaults', () => {
     expect(consciousnessStore.activeProvider).toBe('official-provider')
     expect(consciousnessStore.activeModel).toBe('auto')
     expect(consciousnessStore.customModelName).toBe('')
-    expect(hearingStore.activeTranscriptionProvider).toBe(OFFICIAL_TRANSCRIPTION_PROVIDER_ID)
-    expect(hearingStore.activeTranscriptionModel).toBe('auto')
+    expect(hearingStore.activeTranscriptionProvider).toBe(WHISPER_LOCAL_PROVIDER_ID)
+    expect(hearingStore.activeTranscriptionModel).toBe(DEFAULT_WHISPER_MODEL_ID)
     expect(hearingStore.activeCustomModelName).toBe('')
     expect(speechStore.activeSpeechProvider).toBe(OFFICIAL_SPEECH_PROVIDER_ID)
     expect(speechStore.activeSpeechModel).toBe('auto')
@@ -242,13 +249,15 @@ describe('official provider module defaults', () => {
     const providerConfigStore = useProviderConfigStore()
     consciousnessStore.activeProvider = 'custom-provider'
     consciousnessStore.activeModel = 'custom-model'
+    hearingStore.activeTranscriptionProvider = ''
+    hearingStore.activeTranscriptionModel = ''
 
     await expect(configureAsDefaultsIfEmpty()).resolves.toBe(true)
 
     expect(consciousnessStore.activeProvider).toBe('custom-provider')
     expect(consciousnessStore.activeModel).toBe('custom-model')
-    expect(hearingStore.activeTranscriptionProvider).toBe(OFFICIAL_TRANSCRIPTION_PROVIDER_ID)
-    expect(hearingStore.activeTranscriptionModel).toBe('auto')
+    expect(hearingStore.activeTranscriptionProvider).toBe(WHISPER_LOCAL_PROVIDER_ID)
+    expect(hearingStore.activeTranscriptionModel).toBe(DEFAULT_WHISPER_MODEL_ID)
     expect(speechStore.activeSpeechProvider).toBe(OFFICIAL_SPEECH_PROVIDER_ID)
     expect(speechStore.activeSpeechModel).toBe('auto')
     expect(visionStore.activeProvider).toBe('vision-official-provider')
@@ -257,6 +266,22 @@ describe('official provider module defaults', () => {
     expect(providerConfigStore.providers[OFFICIAL_TRANSCRIPTION_PROVIDER_ID]?.status).toBe('configured')
     expect(providerConfigStore.providers[OFFICIAL_SPEECH_PROVIDER_ID]?.status).toBe('configured')
     expect(providerConfigStore.providers['vision-official-provider']?.status).toBe('configured')
+  })
+
+  it('keeps the local Whisper Hearing default and configures the official transcription provider', async () => {
+    const hearingStore = useHearingStore()
+    const providerConfigStore = useProviderConfigStore()
+
+    expect(hearingStore.activeTranscriptionProvider).toBe(WHISPER_LOCAL_PROVIDER_ID)
+    expect(hearingStore.activeTranscriptionModel).toBe(DEFAULT_WHISPER_MODEL_ID)
+
+    await expect(configureAsDefaultsIfEmpty()).resolves.toBe(true)
+
+    expect(hearingStore.activeTranscriptionProvider).toBe(WHISPER_LOCAL_PROVIDER_ID)
+    expect(hearingStore.activeTranscriptionModel).toBe(DEFAULT_WHISPER_MODEL_ID)
+    expect(providerConfigStore.providers[OFFICIAL_TRANSCRIPTION_PROVIDER_ID]?.status).toBe('configured')
+    expect(providerConfigStore.providers[OFFICIAL_TRANSCRIPTION_PROVIDER_ID]?.configuredBy).toBe('authentication')
+    expect(providerConfigStore.addedProviders[OFFICIAL_TRANSCRIPTION_PROVIDER_ID]).toBe(true)
   })
 
   // ROOT CAUSE:
@@ -320,13 +345,17 @@ describe('official provider module defaults', () => {
     await providerStore.forceProviderConfigured(OFFICIAL_SPEECH_STREAMING_PROVIDER_ID)
     speechStore.activeSpeechProvider = OFFICIAL_SPEECH_STREAMING_PROVIDER_ID
     speechStore.activeSpeechModel = 'streaming-model'
+    hearingStore.activeTranscriptionProvider = OFFICIAL_TRANSCRIPTION_PROVIDER_ID
+    hearingStore.activeTranscriptionModel = 'auto'
+    hearingStore.activeCustomModelName = 'stale-custom-model'
 
     await expect(unconfigureAuthenticationProviders()).resolves.toBe(true)
 
     expect(consciousnessStore.activeProvider).toBe('')
     expect(consciousnessStore.activeModel).toBe('')
-    expect(hearingStore.activeTranscriptionProvider).toBe('')
-    expect(hearingStore.activeTranscriptionModel).toBe('')
+    expect(hearingStore.activeTranscriptionProvider).toBe(WHISPER_LOCAL_PROVIDER_ID)
+    expect(hearingStore.activeTranscriptionModel).toBe(DEFAULT_WHISPER_MODEL_ID)
+    expect(hearingStore.activeCustomModelName).toBe('')
     expect(speechStore.activeSpeechProvider).toBe('speech-noop')
     expect(speechStore.activeSpeechModel).toBe('')
     expect(speechStore.activeSpeechVoiceId).toBe('')

@@ -9,19 +9,101 @@
 // Model IDs
 // ---------------------------------------------------------------------------
 
-/** HuggingFace model repository identifiers */
+/**
+ * HuggingFace model repository identifiers.
+ * Whisper is not listed here because the user selects one of several repositories; see {@link WHISPER_MODELS}.
+ */
 export const MODEL_IDS = {
   KOKORO: 'onnx-community/Kokoro-82M-v1.0-ONNX',
-  WHISPER: 'onnx-community/whisper-large-v3-turbo',
   BG_REMOVAL: 'Xenova/modnet',
 } as const
 
-/** Short model identifiers used in adapter state tracking and logging */
+/**
+ * Short model identifiers used in adapter state tracking and logging.
+ * Whisper uses its {@link WhisperModelId} values instead.
+ */
 export const MODEL_NAMES = {
   KOKORO: 'kokoro-82m',
-  WHISPER: 'whisper-large-v3-turbo',
   BG_REMOVAL: 'modnet',
 } as const
+
+/**
+ * A Whisper speech-to-text model that the local Whisper worker can load.
+ *
+ * Hearing settings store `id`, the Whisper adapter sends `id` to the worker in `load-model`, and the worker resolves
+ * `repo` from this table. The table is the allow-list: the worker rejects an ID that is not in it.
+ */
+export interface WhisperModelDefinition {
+  /** Stable model ID stored in Hearing settings and sent by the provider. */
+  id: 'whisper-base' | 'whisper-small' | 'whisper-large-v3-turbo'
+  /** Hugging Face repository that the worker downloads. */
+  repo: string
+  /** English display name, e.g. 'Whisper Small'. */
+  name: string
+  /** i18n key for a one-sentence description (another agent adds the English text). */
+  descriptionKey: string
+  /** Rough GPU memory estimate in bytes for the GPU coordinator. */
+  vramEstimateBytes: number
+}
+
+/**
+ * Whisper models offered for local transcription, smallest first.
+ *
+ * All three repositories are standard transformers.js conversions (`encoder_model{,_fp16}.onnx` and
+ * `decoder_model_merged_q4.onnx`), which the worker's dtype selection relies on.
+ *
+ * `vramEstimateBytes` values are estimates for the fp16 encoder plus the q4 decoder, not measurements. The GPU
+ * coordinator only uses them for advisory memory-pressure bookkeeping.
+ */
+export const WHISPER_MODELS: readonly WhisperModelDefinition[] = Object.freeze([
+  {
+    id: 'whisper-base',
+    repo: 'onnx-community/whisper-base',
+    name: 'Whisper Base',
+    descriptionKey: 'settings.pages.providers.provider.whisper-local.models.whisper-base.description',
+    // Estimate: ~74M parameters.
+    vramEstimateBytes: 200 * 1024 * 1024,
+  },
+  {
+    id: 'whisper-small',
+    repo: 'onnx-community/whisper-small',
+    name: 'Whisper Small',
+    descriptionKey: 'settings.pages.providers.provider.whisper-local.models.whisper-small.description',
+    // Estimate: ~244M parameters.
+    vramEstimateBytes: 500 * 1024 * 1024,
+  },
+  {
+    id: 'whisper-large-v3-turbo',
+    repo: 'onnx-community/whisper-large-v3-turbo',
+    name: 'Whisper Large v3 Turbo',
+    descriptionKey: 'settings.pages.providers.provider.whisper-local.models.whisper-large-v3-turbo.description',
+    // Estimate: ~809M parameters, most of them in the fp16 encoder.
+    vramEstimateBytes: 800 * 1024 * 1024,
+  },
+])
+
+export type WhisperModelId = WhisperModelDefinition['id']
+
+/** The model that a new local Whisper setup uses. Small balances accuracy against download size and speed. */
+export const DEFAULT_WHISPER_MODEL_ID: WhisperModelId = 'whisper-small'
+
+export function isWhisperModelId(value: string): value is WhisperModelId {
+  return WHISPER_MODELS.some(model => model.id === value)
+}
+
+/**
+ * Returns the definition of a Whisper model.
+ *
+ * Throws when `id` is not in {@link WHISPER_MODELS}. That only happens when an unchecked value was cast to
+ * {@link WhisperModelId}; validate untrusted input with {@link isWhisperModelId} first.
+ */
+export function getWhisperModel(id: WhisperModelId): WhisperModelDefinition {
+  const definition = WHISPER_MODELS.find(model => model.id === id)
+  if (!definition)
+    throw new Error(`Unknown Whisper model: ${id}`)
+
+  return definition
+}
 
 // ---------------------------------------------------------------------------
 // Timeouts (ms)
@@ -33,9 +115,17 @@ export const TIMEOUTS = {
   /** Kokoro audio generation timeout */
   KOKORO_GENERATE: 120_000,
 
-  /** Whisper model load timeout (larger model, allow more time) */
+  /**
+   * Whisper model load inactivity timeout: the longest time a load may go without a progress message for its request.
+   * Every progress message restarts the timer, so a slow download that keeps progressing does not fail. The silent
+   * phases (ONNX session creation and the warm-up run) must each finish within this time.
+   */
   WHISPER_LOAD: 180_000,
-  /** Whisper transcription timeout */
+  /**
+   * Whisper transcription inactivity timeout: the longest time a transcription may go without a progress message for
+   * its request. The worker sends a progress message for each piece of streamed text, so long outputs do not fail.
+   * The encoder pass and the decoding before the first word must finish within this time.
+   */
   WHISPER_TRANSCRIBE: 120_000,
 
   /** Background removal model load timeout */
