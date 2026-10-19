@@ -159,3 +159,6 @@ packages/i18n/glossary/glossary.tbx
 
 /airi-docs/
 .worktrees/
+
+# Graphify output (regenerate with `graphify update .`)
+graphify-out/
