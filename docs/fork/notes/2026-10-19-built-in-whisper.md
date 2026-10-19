@@ -38,7 +38,8 @@ flowchart LR
    `fetch` answers the request on the device:
    - It reads the multipart body that `@xsai/generate-transcription` sends (file, model, language).
    - It decodes the audio to mono 16 kHz samples with `OfflineAudioContext`.
-   - It loads the selected model (a no-op if it is already loaded) and transcribes.
+   - It splits audio longer than 30 seconds into windows that end in pauses (see Known limits).
+   - It loads the selected model (a no-op if it is already loaded) and transcribes each window.
    - It returns `{ text }` as JSON.
    - It sends a language hint only when Whisper supports that language. Otherwise Whisper detects
      the language.
@@ -73,9 +74,45 @@ leaves them as they are.
 - **Existing installs are not migrated.** If an install already saved an empty Hearing provider, it
   stays empty until the user picks a provider or logs in. AGENTS.md does not allow silent
   compatibility code.
-- **30-second window.** Whisper hears at most 30 seconds per recording. Voice activity detection
-  normally splits speech into shorter phrases.
+- **Long recordings are split.** Whisper reads at most 30 seconds at a time. A longer recording is
+  transcribed in windows of up to 30 seconds. Each window ends at the quietest 100 ms in its last
+  5 seconds, so the cut normally falls in a pause. A window that is more than 50 dB quieter than the
+  loudest part of the recording is skipped, because Whisper writes made-up words for silence. The
+  windows do not overlap: if there is no pause near the limit, a word at the cut can be garbled.
+  Without a language hint, the language is detected again for each window.
 - **First use is slow.** The first transcription downloads the model and compiles it. Later
   transcriptions are fast, especially with WebGPU.
+- **The ONNX Runtime engine comes from a CDN.** transformers.js 3.8.1 loads its WebAssembly engine
+  (`ort-wasm-simd-threaded.jsep.*`, about 21 MB) from `cdn.jsdelivr.net` unless the app sets
+  `env.backends.onnx.wasm.wasmPaths` (`src/backends/onnx.js`). AIRI does not set it, so the first use
+  also needs jsDelivr. The local Kokoro voice has the same limit. Fix options: add `onnxruntime-web` as a
+  direct dependency, or copy the two files from `@huggingface/transformers/dist` at build time.
 - **Confidence filter.** The Hearing confidence filter needs confidence scores for each segment.
   Whisper (Local) does not return them, so the filter has no effect and Hearing logs a warning.
+
+## How it was tested
+
+`huggingface.co` and `cdn.jsdelivr.net` are blocked in the cloud session. A temporary browser harness ran the
+real code in Chromium and answered those requests with local files:
+
+- Model: Xenova Whisper Tiny (multilingual, 80 mel bins, same vocabulary as Base and Small) from the
+  `sts-whisper-tiny` npm package, served under the `onnx-community/whisper-small` and `whisper-base` names.
+- Engine: the identical `ort-wasm-simd-threaded.jsep.*` files from the installed transformers.js package.
+- Audio: `packages/testing-audio` fixtures, plus German and Spanish clips made with eSpeak NG.
+- Device: WebAssembly (no GPU in the headless browser).
+
+| Test | Result |
+| --- | --- |
+| English, English hint, first use (download, load, warm-up, transcribe) | "microphone warm up. Hello, Eric, please say hello." in about 15 s |
+| English again, model loaded | Same text in about 3.5 s |
+| English, no hint | Correct; "Microphone warm up." appears twice |
+| German / Spanish with a hint | "Guten Morgen! Heute ist das mit der Mere schön und ich gerne den Park." / "Muy bien, hoy voy a cambiar el parque." |
+| Switch Small to Base | Model reloaded, correct text |
+| 36 s recording with speech at 29–33 s | Two windows (28.95 s and 7.16 s); the second utterance is transcribed. A single 30 s call kept only "My microphone warm up." |
+
+Without a hint, the German and Spanish clips came out wrong ("Thank you for watching!", "(sad)"). An independent
+check with plain transformers.js showed that Tiny itself ranks this robotic German as English (48.6 %) and the
+Spanish as Latin (31 %), and the detection step picked exactly those languages (`<|la|>` in the token IDs). So
+the detection code works; Tiny on synthetic speech is not reliable. Hearing normally sends the interface
+language as a hint. Accuracy of the real Small and Large v3 Turbo models and WebGPU speed still need a test on
+a real machine.

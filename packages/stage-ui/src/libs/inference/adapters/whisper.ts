@@ -10,6 +10,8 @@
  *   `terminate()` destroys it, together with what it held (`loadedModelId` and the GPU allocation).
  * - `loadedModelId`: the model that the current worker reported in its last `model-ready`. It is cleared whenever the
  *   adapter cannot tell what the worker holds: after a failed or cancelled load, or when the worker is destroyed.
+ * - `allocationToken`: the GPU coordinator's record of `loadedModelId`. It is requested on `model-ready` and released
+ *   whenever `loadedModelId` is cleared, so the coordinator never counts a model that the worker may have disposed.
  * - `activeModelId`: the model of the latest load attempt. It keys the inference status entry and device-loss
  *   telemetry, so the settings page can follow one model's download.
  * - `state`: 'ready' only while a model is loaded and no operation runs.
@@ -155,23 +157,48 @@ function isAbortError(error: unknown): boolean {
 }
 
 /**
+ * Path prefix of the model weight files in a load progress message.
+ *
+ * NOTICE:
+ * transformers.js `PreTrainedModel.from_pretrained` reads the ONNX sessions, and their external data files, from the
+ * `onnx` subfolder of the repository by default, and the worker does not change that subfolder.
+ * Source: node_modules/@huggingface/transformers/src/models.js, `from_pretrained` (`subfolder = 'onnx'`), v3.8.1.
+ * Removal condition: the worker reports which files are model weights.
+ */
+const MODEL_WEIGHT_FILE_PREFIX = 'onnx/'
+
+/**
  * Sums the latest byte counts of every file in a load into one percentage, so a status reader sees one figure for
  * the whole download instead of the figure of whichever file reported last. Files whose total is still unknown count
  * as zero bytes.
  *
+ * Returns -1 (indeterminate) until a model weight file is known and every known weight file has sent bytes.
+ * transformers.js downloads config.json, the tokenizer, and the processor files first, and starts the weight files
+ * only after config.json. A weight file adds its whole size when its first bytes arrive, so a figure taken before
+ * that reads too high, up to 100% from the small files alone, and falls when the weight file arrives.
+ *
  * @example
- * aggregateDownloadPercent(new Map([['a', { loaded: 50, total: 100 }], ['b', { loaded: 0, total: 300 }]]))
+ * aggregateDownloadPercent(new Map([['config.json', { loaded: 2, total: 2 }], ['onnx/b.onnx', { loaded: 0, total: 0 }]]))
+ * // => -1
+ * aggregateDownloadPercent(new Map([['onnx/a.onnx', { loaded: 50, total: 100 }], ['onnx/b.onnx', { loaded: 1, total: 300 }]]))
  * // => 13
  */
 function aggregateDownloadPercent(files: ReadonlyMap<string, { loaded: number, total: number }>): number {
   let loaded = 0
   let total = 0
-  for (const file of files.values()) {
-    loaded += file.loaded
-    total += file.total
+  let hasWeightFile = false
+  for (const [file, bytes] of files) {
+    if (file.startsWith(MODEL_WEIGHT_FILE_PREFIX)) {
+      // transformers.js reports a total above zero with every byte count, so a zero total means no bytes yet.
+      if (bytes.total === 0)
+        return -1
+      hasWeightFile = true
+    }
+    loaded += bytes.loaded
+    total += bytes.total
   }
 
-  return total > 0 ? Math.round(loaded / total * 100) : -1
+  return hasWeightFile ? Math.round(loaded / total * 100) : -1
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +282,11 @@ export function createWhisperAdapter(workerUrl: string | URL): WhisperAdapter {
       worker = null
     }
 
+    forgetLoadedModel()
+  }
+
+  /** Clears `loadedModelId` and releases its GPU allocation, for when the adapter cannot tell what the worker holds. */
+  function forgetLoadedModel(): void {
     loadedModelId = null
     if (allocationToken) {
       getGPUCoordinator().release(allocationToken)
@@ -410,12 +442,13 @@ export function createWhisperAdapter(workerUrl: string | URL): WhisperAdapter {
 
   /**
    * Records a failed or cancelled load. The worker may have disposed the previous model before the failure, so no
-   * model is known to be loaded afterwards. A cancelled load returns to 'idle': it is the caller's decision, not a
-   * failure.
+   * model is known to be loaded afterwards, and the previous model's GPU allocation is released. A cancelled load
+   * returns to 'idle': it is the caller's decision, not a failure.
    */
   function markLoadFailed(modelId: WhisperModelId, error: unknown): void {
-    loadedModelId = null
-    // terminate() or exhausted restarts already moved the adapter to its final state and cleaned up its status.
+    forgetLoadedModel()
+    // terminate() removed the status entry, and exhausted restarts already set it to 'error'. The adapter is final,
+    // so leave both its state and the status entry unchanged.
     if (state === 'terminated')
       return
 
@@ -468,6 +501,10 @@ export function createWhisperAdapter(workerUrl: string | URL): WhisperAdapter {
           const w = ensureWorker()
           const requestId = createRequestId()
           const downloadedBytes = new Map<string, { loaded: number, total: number }>()
+          // Highest aggregate reported in this load. A file that sends its first bytes late, such as the fp32 encoder
+          // that the worker downloads after an fp16 failure, grows the byte total and lowers the aggregate. The
+          // status keeps the highest figure, so the progress bar never moves back.
+          let downloadPercent = -1
 
           const readyPromise = waitForMessage(w, requestId, 'model-ready', {
             timeout: LOAD_TIMEOUT,
@@ -481,15 +518,27 @@ export function createWhisperAdapter(workerUrl: string | URL): WhisperAdapter {
                 total: payload.total,
               }
 
-              if (progress.phase === 'download' && progress.file && progress.loaded !== undefined && progress.total !== undefined) {
-                downloadedBytes.set(progress.file, { loaded: progress.loaded, total: progress.total })
-                updateInferenceStatus(modelId, {
-                  progress: { phase: 'download', percent: aggregateDownloadPercent(downloadedBytes), message: progress.message },
-                })
+              if (progress.phase === 'download' && progress.file) {
+                if (progress.loaded === undefined || progress.total === undefined) {
+                  // A per-file 'initiate' message: the file has started but has no byte counts yet. It is recorded
+                  // with an unknown total, so the aggregate waits for its first bytes. A file that already sent bytes
+                  // keeps them.
+                  if (!downloadedBytes.has(progress.file))
+                    downloadedBytes.set(progress.file, { loaded: 0, total: 0 })
+                }
+                else {
+                  downloadedBytes.set(progress.file, { loaded: progress.loaded, total: progress.total })
+                  downloadPercent = Math.max(downloadPercent, aggregateDownloadPercent(downloadedBytes))
+                  // Until the weight files send bytes, the status keeps the indeterminate "Loading model..." message.
+                  if (downloadPercent >= 0) {
+                    updateInferenceStatus(modelId, {
+                      progress: { phase: 'download', percent: downloadPercent, message: progress.message },
+                    })
+                  }
+                }
               }
               else if (!progress.file) {
-                // Phase messages without a file, such as "Loading model..." or the warm-up. Per-file 'initiate'
-                // messages are skipped so they do not reset the aggregate percentage.
+                // Phase messages without a file, such as "Loading model..." or the warm-up.
                 updateInferenceStatus(modelId, {
                   state: progress.phase === 'warmup' ? 'warming-up' : 'downloading',
                   progress,
@@ -619,10 +668,6 @@ export function createWhisperAdapter(workerUrl: string | URL): WhisperAdapter {
     get deviceLossCount() { return deviceLossCount },
   }
 }
-
-// ---------------------------------------------------------------------------
-// Singleton
-// ---------------------------------------------------------------------------
 
 let globalAdapter: WhisperAdapter | null = null
 const singletonMutex = new Mutex()

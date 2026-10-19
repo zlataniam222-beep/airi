@@ -40,7 +40,10 @@ export interface WhisperModelDefinition {
   repo: string
   /** English display name, e.g. 'Whisper Small'. */
   name: string
-  /** i18n key for a one-sentence description (another agent adds the English text). */
+  /**
+   * i18n key of a one-sentence description of the model. The whisper-local provider's model catalog and the
+   * Whisper (Local) settings page translate it for their model pickers.
+   */
   descriptionKey: string
   /** Rough GPU memory estimate in bytes for the GPU coordinator. */
   vramEstimateBytes: number

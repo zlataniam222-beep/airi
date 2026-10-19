@@ -368,9 +368,16 @@ watch(activeTranscriptionProvider, async (provider, previousProvider) => {
   await hearingStore.loadModelsForProvider(provider)
   syncOpenAICompatibleSettings()
 
+  // A saved model that the new Provider lists stays selected. Otherwise the Provider's own default
+  // model wins, for example Whisper Small for Whisper (Local). The first listed model applies only
+  // to a Provider whose catalog declares no default model, or a default that it does not list.
   const models = providerModels.value
-  if (models.length > 0 && !models.some(model => model.id === activeTranscriptionModel.value))
-    activeTranscriptionModel.value = models[0].id
+  if (models.length > 0 && !models.some(model => model.id === activeTranscriptionModel.value)) {
+    const defaultModel = providersStore.getDefaultModelForProvider(provider)
+    activeTranscriptionModel.value = defaultModel && models.some(model => model.id === defaultModel)
+      ? defaultModel
+      : models[0].id
+  }
 
   if (shouldRestartMonitoring)
     isMonitoring.value = await setupAudioMonitoring()

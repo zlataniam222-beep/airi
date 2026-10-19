@@ -2,6 +2,30 @@
 
 Newest entries first. See [`README.md`](./README.md) for the entry format.
 
+## 2026-10-19: Whisper (Local) review fixes: long recordings, default model, progress
+
+- **What:**
+  - Recordings longer than 30 s are now transcribed in windows that end in pauses. Before, everything after
+    30 s was dropped without an error.
+  - Choosing Whisper (Local) in Settings > Hearing now selects Whisper Small, the provider's declared default.
+    Before, the page took the first listed model (Base).
+  - The download progress no longer jumps to 100 % and back.
+  - A failed model switch releases the old model's GPU memory reservation.
+  - Comments fixed, a new section banner removed, and regression tests added for restarts and the shared adapter.
+- **Why:** two rounds of multi-agent review. Each finding needed at least 2 of 3 independent skeptics to agree.
+  The first round confirmed 12 findings and the second round 7 (on the fixes themselves).
+- **Files:** `packages/stage-ui/src/libs/providers/providers/whisper-local/index.ts` (+ browser test),
+  `packages/stage-ui/src/libs/inference/{adapters/whisper.ts,adapters/whisper.test.ts,constants.ts,protocol.ts}`,
+  `packages/stage-pages/src/pages/settings/modules/hearing.vue` (+ new `hearing.browser.test.ts`),
+  `docs/fork/notes/2026-10-19-built-in-whisper.md`.
+- **Branch / commit:** `claude/zen-feynman-fhw9jh`.
+- **Notes:**
+  - Checks: stage-ui, stage-pages and stage-layouts typecheck pass; 250 stage-ui node tests, 14 provider browser
+    tests, 3 Hearing page browser tests and 38 stage-layouts tests pass; lint has no new warnings.
+  - The real end-to-end harness (Whisper Tiny standing in for Small and Base, see the note) passes 10 cases. With
+    a 36 s recording, the speech at 29–33 s is now transcribed.
+  - Open question for the user: how to ship the ONNX Runtime engine that transformers.js now loads from jsDelivr.
+
 ## 2026-10-19: Chat microphone button works with Whisper (Local)
 
 - **What:** the chat-area microphone button now dictates with Hearing providers that cannot stream input, such

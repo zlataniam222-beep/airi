@@ -1,8 +1,10 @@
+import type { removeInferenceStatus, updateInferenceStatus } from '../../../composables/use-inference-status'
+import type { AllocationToken } from '../gpu-resource-coordinator'
 import type { LoadModelRequest, WorkerInboundMessage, WorkerOutboundMessage } from '../protocol'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { getWhisperModel, TIMEOUTS } from '../constants'
+import { getWhisperModel, MAX_RESTARTS, RESTART_DELAY_MS, TIMEOUTS } from '../constants'
 
 type MockWorkerEvent = { data: WorkerOutboundMessage } | { error: Error }
 
@@ -36,20 +38,21 @@ class MockWorker {
 vi.stubGlobal('Worker', MockWorker)
 
 const inferenceStatus = vi.hoisted(() => ({
-  removeInferenceStatus: vi.fn(),
-  updateInferenceStatus: vi.fn(),
+  removeInferenceStatus: vi.fn<typeof removeInferenceStatus>(),
+  updateInferenceStatus: vi.fn<typeof updateInferenceStatus>(),
 }))
 
 vi.mock('../../../composables/use-inference-status', () => inferenceStatus)
 
 const enqueueMock = vi.fn((_id: string, _p: number, loader: () => Promise<unknown>) => loader())
 const recordDeviceLoss = vi.fn()
-const requestAllocation = vi.fn((modelId: string, bytes: number) => ({ allocatedAt: 0, bytes, lastUsedAt: 0, modelId }))
+const release = vi.fn<(token: AllocationToken) => void>()
+const requestAllocation = vi.fn((modelId: string, bytes: number): AllocationToken => ({ allocatedAt: 0, bytes, lastUsedAt: 0, modelId }))
 
 vi.mock('../coordinator', () => ({
   getGPUCoordinator: () => ({
     recordDeviceLoss,
-    release: vi.fn(),
+    release,
     requestAllocation,
     touch: vi.fn(),
   }),
@@ -85,6 +88,12 @@ function answerLoad(worker: MockWorker, request: LoadModelRequest): void {
   })
 }
 
+/** Download percentages written to the inference status entry of `modelId`, in the order they were written. */
+function reportedDownloadPercents(modelId: string): number[] {
+  return inferenceStatus.updateInferenceStatus.mock.calls.flatMap(([id, update]) =>
+    id === modelId && update.progress?.phase === 'download' ? [update.progress.percent] : [])
+}
+
 async function createLoadedAdapter(modelId: 'whisper-base' | 'whisper-small') {
   const { createWhisperAdapter } = await import('./whisper')
   const adapter = createWhisperAdapter(new URL('whisper-worker.ts', import.meta.url))
@@ -106,6 +115,7 @@ describe('whisper adapter worker failure handling', () => {
     enqueueMock.mockClear()
     enqueueMock.mockImplementation((_id: string, _p: number, loader: () => Promise<unknown>) => loader())
     recordDeviceLoss.mockClear()
+    release.mockClear()
     requestAllocation.mockClear()
     inferenceStatus.updateInferenceStatus.mockClear()
     inferenceStatus.removeInferenceStatus.mockClear()
@@ -147,6 +157,76 @@ describe('whisper adapter worker failure handling', () => {
     await expect(transcribing).rejects.toThrow('Whisper worker crashed during transcription')
     expect(adapter.state).toBe('error')
   })
+
+  it('starts a new worker after the restart delay when the worker crashes', async () => {
+    const { worker } = await createLoadedAdapter('whisper-small')
+
+    worker.dispatch('error', { error: new Error('Whisper worker crashed') })
+    await vi.advanceTimersByTimeAsync(RESTART_DELAY_MS)
+
+    expect(worker.terminate).toHaveBeenCalled()
+    expect(MockWorker.instances).toHaveLength(2)
+  })
+
+  // ROOT CAUSE:
+  //
+  // `terminate()` kept the restart timer that a crash scheduled, and the timer did not check the state, so a
+  // terminated adapter started a new worker.
+  //
+  // setTimeout(() => ensureWorker(), delay)
+  //
+  // We fixed this by clearing the timer in `terminate()` and checking the state.
+  // if (state !== 'terminated') ensureWorker()
+  it('does not start a new worker when terminate() runs during the restart delay', async () => {
+    const { adapter, worker } = await createLoadedAdapter('whisper-small')
+
+    worker.dispatch('error', { error: new Error('Whisper worker crashed') })
+    adapter.terminate()
+    await vi.advanceTimersByTimeAsync(RESTART_DELAY_MS * MAX_RESTARTS)
+
+    expect(MockWorker.instances).toHaveLength(1)
+    expect(adapter.state).toBe('terminated')
+  })
+})
+
+describe('getWhisperAdapter', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    MockWorker.instances.length = 0
+    enqueueMock.mockClear()
+    enqueueMock.mockImplementation((_id: string, _p: number, loader: () => Promise<unknown>) => loader())
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('returns the same adapter while it is in error state', async () => {
+    const { getWhisperAdapter } = await import('./whisper')
+    const adapter = await getWhisperAdapter()
+
+    const loading = adapter.load()
+    await vi.waitFor(() => expect(MockWorker.instances).toHaveLength(1))
+    MockWorker.instances[0].dispatch('error', { error: new Error('Whisper worker crashed while loading') })
+    await expect(loading).rejects.toThrow('Whisper worker crashed while loading')
+    expect(adapter.state).toBe('error')
+
+    // The next load() recovers this adapter. A new adapter would reset its device-loss count, which moves loads to
+    // WASM after repeated WebGPU device losses.
+    await expect(getWhisperAdapter()).resolves.toBe(adapter)
+  })
+
+  it('returns a new adapter after the previous one is terminated', async () => {
+    const { getWhisperAdapter } = await import('./whisper')
+    const adapter = await getWhisperAdapter()
+
+    adapter.terminate()
+    const replacement = await getWhisperAdapter()
+
+    expect(replacement).not.toBe(adapter)
+    expect(replacement.state).toBe('idle')
+  })
 })
 
 describe('whisper adapter model selection', () => {
@@ -155,6 +235,7 @@ describe('whisper adapter model selection', () => {
     MockWorker.instances.length = 0
     enqueueMock.mockClear()
     enqueueMock.mockImplementation((_id: string, _p: number, loader: () => Promise<unknown>) => loader())
+    release.mockClear()
     requestAllocation.mockClear()
     inferenceStatus.updateInferenceStatus.mockClear()
     inferenceStatus.removeInferenceStatus.mockClear()
@@ -211,7 +292,45 @@ describe('whisper adapter model selection', () => {
     expect(inferenceStatus.updateInferenceStatus).toHaveBeenLastCalledWith('whisper-small', expect.objectContaining({ state: 'ready', device: 'webgpu' }))
   })
 
-  it('reports the download of all model files as one percentage under the model ID', async () => {
+  // ROOT CAUSE:
+  //
+  // A failed model switch cleared `loadedModelId` but kept the previous model's GPU allocation, although the worker
+  // disposes that model before it loads the next one.
+  //
+  // loadedModelId = null
+  //
+  // We fixed this by releasing the allocation whenever `loadedModelId` is cleared.
+  // forgetLoadedModel()
+  it('releases the previous model\'s GPU allocation when a model switch fails', async () => {
+    const { adapter, worker } = await createLoadedAdapter('whisper-base')
+    const baseAllocation = requestAllocation.mock.results[0].value
+
+    const switching = adapter.load(undefined, { modelId: 'whisper-small' })
+    await vi.waitFor(() => expect(loadRequestsOf(worker)).toHaveLength(2))
+    worker.dispatch('message', {
+      data: {
+        type: 'error',
+        requestId: loadRequestsOf(worker)[1].requestId,
+        payload: { code: 'LOAD_FAILED', message: 'Failed to download whisper-small', recoverable: false },
+      },
+    })
+
+    await expect(switching).rejects.toThrow('Failed to download whisper-small')
+    expect(adapter.state).toBe('error')
+    expect(adapter.loadedModelId).toBeNull()
+    expect(release).toHaveBeenCalledWith(baseAllocation)
+  })
+
+  // ROOT CAUSE:
+  //
+  // The percentage summed only files that had sent bytes. config.json finishes before the weight files send bytes,
+  // so the status read 100% and then fell.
+  //
+  // percent: aggregateDownloadPercent(downloadedBytes)
+  //
+  // We fixed this by waiting for every started weight file and keeping the highest figure.
+  // Math.max(downloadPercent, aggregateDownloadPercent(downloadedBytes))
+  it('reports one download percentage that waits for every started weight file and never falls', async () => {
     const { createWhisperAdapter } = await import('./whisper')
     const adapter = createWhisperAdapter(new URL('whisper-worker.ts', import.meta.url))
 
@@ -221,20 +340,29 @@ describe('whisper adapter model selection', () => {
     await vi.waitFor(() => expect(loadRequestsOf(worker)).toHaveLength(1))
     const request = loadRequestsOf(worker)[0]
 
+    // The worker forwards transformers.js 'initiate' events without byte counts, then 'progress' events with them.
+    const startFile = (file: string) => worker.dispatch('message', {
+      data: { type: 'progress', requestId: request.requestId, payload: { phase: 'download', percent: 0, message: `Loading ${file}`, file } },
+    })
     const reportFile = (file: string, loaded: number, total: number) => worker.dispatch('message', {
       data: { type: 'progress', requestId: request.requestId, payload: { phase: 'download', percent: Math.round(loaded / total * 100), file, loaded, total } },
     })
 
-    reportFile('onnx/encoder_model_fp16.onnx', 50, 100)
-    reportFile('onnx/decoder_model_merged_q4.onnx', 0, 300)
-    expect(inferenceStatus.updateInferenceStatus).toHaveBeenLastCalledWith('whisper-base', {
-      progress: expect.objectContaining({ phase: 'download', percent: 13 }),
-    })
+    reportFile('config.json', 10, 10)
+    startFile('onnx/decoder_model_merged_q4.onnx')
+    startFile('onnx/encoder_model_fp16.onnx')
+    // An encoder read from the browser cache can finish before the decoder sends its first bytes.
+    reportFile('onnx/encoder_model_fp16.onnx', 90, 90)
+    expect(reportedDownloadPercents('whisper-base')).toEqual([])
 
+    reportFile('onnx/decoder_model_merged_q4.onnx', 100, 300)
+    expect(reportedDownloadPercents('whisper-base')).toEqual([50])
+
+    // The fp16 encoder failed to start, so the worker downloads the fp32 encoder. It lowers the aggregate to 30%.
+    startFile('onnx/encoder_model.onnx')
+    reportFile('onnx/encoder_model.onnx', 40, 400)
     reportFile('onnx/decoder_model_merged_q4.onnx', 300, 300)
-    expect(inferenceStatus.updateInferenceStatus).toHaveBeenLastCalledWith('whisper-base', {
-      progress: expect.objectContaining({ phase: 'download', percent: 88 }),
-    })
+    expect(reportedDownloadPercents('whisper-base')).toEqual([50, 50, 55])
 
     answerLoad(worker, request)
     await loading

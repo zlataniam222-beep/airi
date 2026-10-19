@@ -32,7 +32,6 @@ export interface ProgressPayload {
    *
    * Adapters are responsible for normalizing worker-specific ranges:
    * - @huggingface/transformers progress_callback: already 0-100
-   * - Whisper status 'progress': 0-1 → multiply by 100
    */
   percent: number
   /** Optional human-readable status */
